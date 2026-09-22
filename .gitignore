@@ -1,0 +1,4 @@
+build/
+
+# Generated local Serena assistant configuration and cache.
+.serena/
