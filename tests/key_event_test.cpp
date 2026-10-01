@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <initializer_list>
 
 using keeby::classify_key_value;
 using keeby::KeyEventKind;
@@ -17,6 +18,18 @@ int main() {
     // not just the documented three values.
     assert(classify_key_value(3) == KeyEventKind::Repeat);
     assert(classify_key_value(-1) == KeyEventKind::Repeat);
+
+    assert(keeby::is_supported_input_code(KEY_A));
+    for (uint16_t code : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}) {
+        assert(keeby::is_supported_input_code(code));
+        assert(keeby::is_pointer_button_code(code));
+    }
+    assert(keeby::is_supported_input_code(KEY_FN));
+    assert(!keeby::is_supported_input_code(256));
+    assert(!keeby::is_supported_input_code(271));
+    assert(!keeby::is_supported_input_code(275));
+    assert(!keeby::is_supported_input_code(463));
+    assert(!keeby::is_supported_input_code(BTN_SIDE));
 
     std::printf("key_event_test: OK\n");
     return 0;
