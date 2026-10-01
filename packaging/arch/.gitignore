@@ -1,0 +1,5 @@
+# makepkg outputs -- never part of the patch.
+/src/
+/pkg/
+/*.pkg.tar.*
+/*.log

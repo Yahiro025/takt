@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=KEEBY
+Comment=Mechanical keyboard typing sounds
+Exec=keeby-settings
+Icon=keeby
+Terminal=false
+Categories=AudioVideo;Audio;Utility;

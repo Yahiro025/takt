@@ -1,0 +1,6 @@
+KEEBY has not yet chosen an open-source license. Until one is picked, this
+package is provided as-is for personal use on the machine it was built for;
+all rights are reserved by the project's author in the meantime. This file
+exists only so the package has something at the conventional
+/usr/share/licenses/<pkg>/LICENSE path (see license=('custom') in
+packaging/arch/PKGBUILD) -- ask the author before any redistribution.

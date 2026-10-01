@@ -1,0 +1,67 @@
+# post_install/post_upgrade run systemd-sysusers explicitly because pacman's
+# own sysusers.d hook fires only once, at the very end of the whole
+# transaction -- after every package's scriptlets have already run -- so the
+# 'keeby' group would not exist yet when setfacl below needs it. See
+# docs/010-step-2.9-packaging.md.
+
+_verify() {
+    local helper=/usr/lib/keeby/keeby-inputd
+    local ok=1
+    if ! getfacl -p "$helper" 2>/dev/null | grep -q '^group:keeby:--x$'; then
+        echo "*** ERROR: keeby: expected ACL 'group:keeby:--x' missing on $helper ***" >&2
+        ok=0
+    fi
+    local mode
+    mode="$(stat -c %A "$helper")"
+    if [ "${mode:6:1}" != "s" ]; then
+        echo "*** ERROR: keeby: setgid bit missing on $helper (mode: $mode) ***" >&2
+        ok=0
+    fi
+    [ "$ok" -eq 1 ] && echo "keeby: helper permissions verified (root:input 2750 + group:keeby ACL)"
+}
+
+_next_steps() {
+    cat <<'EOF'
+
+keeby installed. Next steps:
+  1. Join the 'keeby' group, then reboot (required once):
+       sudo usermod -aG keeby "$USER"
+     A logout is not enough if lingering is enabled -- it keeps your user
+     session running with its old groups -- but a reboot always works.
+  2. Start it now and on every login:
+       systemctl --user enable --now keeby.service
+     After rebooting, check it with:
+       systemctl --user status keeby.service
+       journalctl --user -u keeby
+     If it looped and failed before you joined the group, clear that first:
+       systemctl --user reset-failed keeby.service
+  3. Optional, more sound packs:
+       keeby-fetch-packs
+EOF
+    if [ -e /usr/local/bin/keeby-inputd ]; then
+        cat <<'EOF'
+
+A manual install from scripts/install-keeby-inputd.sh was also found at
+/usr/local/bin/keeby-inputd. Remove it so only the packaged helper runs:
+       sudo ./scripts/uninstall-keeby-inputd.sh
+EOF
+    fi
+}
+
+post_install() {
+    systemd-sysusers /usr/lib/sysusers.d/keeby.conf
+    setfacl -m g:keeby:x /usr/lib/keeby/keeby-inputd
+    _verify
+    _next_steps
+}
+
+post_upgrade() {
+    # pacman replaces keeby-inputd's file wholesale on every upgrade, which
+    # drops any POSIX ACL the old inode had -- re-apply it every time.
+    post_install
+}
+
+post_remove() {
+    echo "keeby: the 'keeby' group was left in place (harmless if unused)."
+    echo "keeby: remove it yourself if you want to: sudo groupdel keeby"
+}

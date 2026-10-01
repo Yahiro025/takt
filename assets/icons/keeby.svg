@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Original glyph for keeby-settings: a single rounded keycap with a
+       simple sound-wave notch, in our own palette (accent blue on dark
+       slate) -- deliberately not Keeby's own logo/wordmark/keycap art. -->
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#292929"/>
+  <rect x="14" y="14" width="36" height="36" rx="9" fill="#3D3D3D"/>
+  <path d="M24 38 L24 26 M32 42 L32 22 M40 38 L40 26" stroke="#197EF5" stroke-width="4"
+        stroke-linecap="round" fill="none"/>
+</svg>

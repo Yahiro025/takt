@@ -1,0 +1,15 @@
+[Unit]
+Description=KEEBY mechanical keyboard sound effects
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/bin/keeby
+Restart=on-failure
+RestartSec=2
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=graphical-session.target

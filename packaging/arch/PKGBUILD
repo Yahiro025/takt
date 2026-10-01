@@ -1,0 +1,58 @@
+# Maintainer: unpublished, local package (see docs/010-step-2.9-packaging.md)
+#
+# Built from the working tree, not a VCS checkout: the user's work past
+# commit 0e0d8bd is uncommitted, so a git source=() would silently package
+# stale code. $_root points at the actual repo root, two directories up
+# from this file (packaging/arch/../..).
+pkgname=keeby
+pkgver=0.1.0
+pkgrel=12
+pkgdesc="Mechanical-keyboard typing sounds for Linux, with a system tray and D-Bus control"
+arch=('x86_64')
+url=""
+# No license has been chosen for this project yet. 'custom' plus the notice
+# file below is a placeholder until the user/author picks one.
+license=('custom')
+depends=('glibc' 'gcc-libs' 'libevdev' 'libinput' 'libsndfile' 'libpipewire' 'libsamplerate'
+         'sdbus-cpp' 'systemd-libs' 'acl' 'gtk4' 'gtk4-layer-shell')
+makedepends=('cmake' 'ninja' 'nlohmann-json')
+checkdepends=('python')
+install=keeby.install
+source=()
+sha256sums=()
+
+_root="$startdir/../.."
+
+build() {
+    cmake -S "$_root" -B "$srcdir/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DKEEBY_ASSET_DIR=/usr/share/keeby/assets \
+        -DKEEBY_HELPER_PATH=/usr/lib/keeby/keeby-inputd
+    cmake --build "$srcdir/build"
+}
+
+check() {
+    # dbus_menu_test/control_service_test SKIP (exit 77, not a failure) in a
+    # build environment with no session bus; every test fakes PipeWire
+    # (CMakeLists.txt's --wrap= link substitutions) and the input helper
+    # (tests/fake_inputd.cpp), so check() needs no real hardware or root.
+    cd "$srcdir/build" && ctest --output-on-failure
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install "$srcdir/build"
+
+    # keeby-inputd is the only component that opens /dev/input/*. root:input
+    # 2750 here plus the keeby-group ACL (re-applied by keeby.install on
+    # every install/upgrade, since pacman replaces this file wholesale and
+    # an ACL lives on the file's inode, not tracked by the package itself)
+    # is the actual security boundary -- see docs/006 and docs/010.
+    # package() runs under fakeroot, which records this chown/chmod into
+    # the built archive without needing real root here.
+    chown root:input "$pkgdir/usr/lib/keeby/keeby-inputd"
+    chmod 2750 "$pkgdir/usr/lib/keeby/keeby-inputd"
+
+    install -Dm644 "$_root/packaging/arch/LICENSE-NOTICE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
