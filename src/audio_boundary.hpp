@@ -3,7 +3,10 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "event_transport.hpp"
 #include "key_event.hpp"
@@ -61,7 +64,7 @@ inline constexpr std::size_t kMaxEventsPerCallback = 32;
 // itemized audit.
 class AudioBoundary {
 public:
-    explicit AudioBoundary(SampleBank samples = {});
+    explicit AudioBoundary(SoundBank samples = {}, MixerVariation variation = {});
     ~AudioBoundary();
     AudioBoundary(const AudioBoundary&) = delete;
     AudioBoundary& operator=(const AudioBoundary&) = delete;
@@ -72,6 +75,34 @@ public:
     void stop();
 
     const AudioBoundaryCounters& counters() const { return counters_; }
+
+    // Thin forwards to the mixer's atomic control state (see sample_mixer.hpp).
+    // Callable from any thread, including a desktop-shell/tray thread; never
+    // touches PipeWire, never blocks, never runs on the RT callback thread.
+    void set_enabled(bool enabled) noexcept { mixer_.set_enabled(enabled); }
+    bool enabled() const noexcept { return mixer_.enabled(); }
+    void set_master_gain(float gain) noexcept { mixer_.set_master_gain(gain); }
+    float master_gain() const noexcept { return mixer_.master_gain(); }
+    void set_stereo_width(float width) noexcept { mixer_.set_stereo_width(width); }
+    float stereo_width() const noexcept { return mixer_.stereo_width(); }
+    // Not noexcept: off-RT, and heap-allocates its published coefficients
+    // (see SampleMixer::set_tone), matching set_profile()'s allocating
+    // precedent elsewhere in this class's control surface.
+    void set_tone(float x, float y) { mixer_.set_tone(x, y); }
+    std::pair<float, float> tone() const noexcept { return mixer_.tone(); }
+
+    // Step 2.7: off-RT bank swap. AudioBoundary takes ownership of `bank`
+    // and retains it (and any bank superseded but not yet acknowledged)
+    // in retired_ until the RT thread proves it's done with it. Serialized
+    // by the caller (see EngineController's lifecycle_mutex_, which also
+    // serializes this against start()/stop()) -- the same "owner
+    // serializes" contract start()/stop() already had between themselves.
+    void swap_bank(std::unique_ptr<const SoundBank> bank);
+
+    // Test-only introspection: how many banks swap_bank()/stop() are still
+    // holding onto because they aren't yet provably safe to free (or, after
+    // stop(), because they're the one the mixer now actually points to).
+    std::size_t retired_bank_count() const noexcept { return retired_.size(); }
 
     // Public only because it must be assignable into the C
     // pw_stream_events callback table from outside the class.
@@ -87,6 +118,15 @@ private:
     SampleMixer mixer_; // owns immutable samples; destroyed only after stop()
     AudioBoundaryCounters counters_;
     bool started_ = false;
+    // Step 2.7: banks superseded by swap_bank() but not yet provably unused
+    // by the RT thread. A timed-out swap_bank() call frees NOTHING (an
+    // unacknowledged request may still be intermediate, not yet even seen
+    // by the RT thread -- see swap_bank()'s definition); pruning down to
+    // just the acknowledged/active bank happens on a later successful swap,
+    // or in stop() once the RT thread is confirmed gone (which also first
+    // applies any still-pending request synchronously, so the mixer's own
+    // now-active bank is never the one freed).
+    std::vector<std::unique_ptr<const SoundBank>> retired_;
 };
 
 } // namespace keeby

@@ -3,9 +3,13 @@
 #include <pipewire/pipewire.h>
 #include <linux/input-event-codes.h>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <memory>
+#include <thread>
 
 // Replace only stream I/O and selected failure points. The production
 // start/stop/process bodies run unchanged; no server or keyboard is needed.
@@ -112,8 +116,14 @@ int main() {
     fail_connect = fail_loop_start = false;
     {
         keeby::KeyEventTransport events;
-        keeby::AudioBoundary audio({keeby::Sample{{0.1f, -0.1f, 0.2f, -0.2f}},
-                                   keeby::Sample{{0.6f, -0.6f}}});
+        // KEY_A gets no release range: this block's later Repeat/Up checks
+        // deliberately reuse the pre-Step-2.6 "never triggers" expectation.
+        keeby::SoundBank bank;
+        bank.samples = {keeby::Sample{{0.1f, -0.1f, 0.2f, -0.2f}}, keeby::Sample{{0.6f, -0.6f}}};
+        bank.press[KEY_A] = {0, 1};
+        bank.press[KEY_ENTER] = {1, 1};
+        keeby::AudioBoundary audio(std::move(bank),
+                                  {.min_gain = keeby::kVoiceGain, .max_gain = keeby::kVoiceGain});
         assert(audio.start(events));
         std::array<float, (keeby::kMaxFramesPerCallback + 1) * 2> samples;
         samples.fill(99);
@@ -151,7 +161,7 @@ int main() {
         assert(samples[0] == 0 && samples[1] == 0);
         assert(events.try_push({KEY_ENTER, keeby::KeyEventKind::Down, 0}));
         keeby::AudioBoundary::on_process(&audio);
-        assert(samples[0] == 0.3f && samples[1] == -0.3f);
+        assert(samples[0] == 0.6f && samples[1] == -0.6f);
         assert(audio.counters().voices_started == 33);
 
         output.requested = 0; // server offers >4096 frames; fixed work cap wins
@@ -164,7 +174,7 @@ int main() {
         output.requested = 1;
         assert(events.try_push({KEY_A, keeby::KeyEventKind::Down, 0}));
         keeby::AudioBoundary::on_process(&audio); // leaves one frame in a voice
-        assert(samples[0] == 0.05f && samples[1] == -0.05f);
+        assert(samples[0] == 0.1f && samples[1] == -0.1f);
         audio.stop();
         assert(audio.start(events));
         keeby::AudioBoundary::on_process(&audio);
@@ -172,5 +182,212 @@ int main() {
         audio.stop();
         available = nullptr;
     }
+    {
+        keeby::SoundBank bank;
+        for (std::size_t v = 0; v < 3; ++v)
+            bank.samples.push_back(keeby::Sample{
+                std::vector<float>((keeby::kMaxFramesPerCallback + 1) * 2, 0.001f * (v + 1))});
+        bank.press[KEY_A] = {0, 3};
+        keeby::SampleMixer reference(bank);
+        keeby::AudioBoundary audio(std::move(bank));
+        keeby::KeyEventTransport events;
+        assert(audio.start(events));
+        std::array<float, (keeby::kMaxFramesPerCallback + 1) * 2> samples;
+        samples.fill(99);
+        spa_chunk chunk{};
+        spa_data data{};
+        data.data = samples.data(); data.maxsize = sizeof(samples); data.chunk = &chunk;
+        spa_buffer buffer{};
+        buffer.n_datas = 1; buffer.datas = &data;
+        pw_buffer output{};
+        output.buffer = &buffer;
+        available = &output;
+        for (int i = 0; i < 33; ++i)
+            assert(events.try_push({KEY_A, keeby::KeyEventKind::Down, 0}));
+        keeby::AudioBoundary::on_process(&audio);
+        assert(audio.counters().consumed_total == 32 && audio.counters().voices_started == 32);
+        assert(audio.counters().budget_exhausted == 1);
+        assert(chunk.size == keeby::kMaxFramesPerCallback * 2 * sizeof(float));
+        const auto sum = samples[0];
+        assert(sum > 0 && sum < keeby::kOutputPeak);
+        for (std::size_t i = 0; i < keeby::kMaxFramesPerCallback * 2; ++i) assert(samples[i] == sum);
+        assert(samples.back() == 99); // cap applies with all 32 varied voices active
+        keeby::AudioBoundary::on_process(&audio);
+        assert(audio.counters().consumed_total == 33 && audio.counters().voices_dropped == 1);
+        assert(events.dropped_count() == 0);
+        assert(samples[0] == sum && samples[1] == sum); // exact last frame
+        for (std::size_t i = 2; i < keeby::kMaxFramesPerCallback * 2; ++i) assert(samples[i] == 0);
+        audio.stop();
+        assert(audio.start(events));
+        assert(events.try_push({KEY_A, keeby::KeyEventKind::Down, 0}));
+        assert(reference.handle_event({KEY_A, keeby::KeyEventKind::Down, 0}) == keeby::TriggerResult::Started);
+        std::array<float, 2> expected;
+        reference.mix(expected.data(), 1);
+        output.requested = 1;
+        keeby::AudioBoundary::on_process(&audio);
+        assert(samples[0] == expected[0] && samples[1] == expected[1]); // seed/history reset
+        audio.stop();
+        available = nullptr;
+    }
+    { // Step 2.7: swap_bank() while NOT started must free immediately, never wait
+        auto make_bank = [](float v) {
+            keeby::SoundBank bank;
+            bank.samples.push_back(keeby::Sample{{v, -v, v, -v}});
+            bank.press[KEY_A] = {0, 1};
+            return std::make_unique<const keeby::SoundBank>(std::move(bank));
+        };
+        keeby::AudioBoundary audio;
+        const auto start = std::chrono::steady_clock::now();
+        audio.swap_bank(make_bank(0.2f));
+        audio.swap_bank(make_bank(0.3f));
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        // The "started" path polls for an ack for up to 500ms; two of those
+        // would take >= 1s. A stopped-stream swap takes microseconds.
+        assert(elapsed < std::chrono::milliseconds(100));
+    }
+    { // Step 2.7: swap_bank() while started, racing a simulated RT thread
+      // that keeps calling on_process() (i.e. mixer_.mix()'s sync_bank()) --
+      // exercises the real retired_ list/acknowledgement path, not just
+      // SampleMixer's raw atomics (see sound_pack_test's swap safety test).
+        auto make_bank = [](float v) {
+            keeby::SoundBank bank;
+            bank.samples.push_back(keeby::Sample{{v, -v, v, -v}});
+            bank.press[KEY_A] = {0, 1};
+            return std::make_unique<const keeby::SoundBank>(std::move(bank));
+        };
+        keeby::KeyEventTransport events;
+        keeby::AudioBoundary audio;
+        assert(audio.start(events));
+
+        std::array<float, 16> samples{};
+        spa_chunk chunk{};
+        spa_data data{};
+        data.data = samples.data();
+        data.maxsize = sizeof(samples);
+        data.chunk = &chunk;
+        spa_buffer buffer{};
+        buffer.n_datas = 1;
+        buffer.datas = &data;
+        pw_buffer output{};
+        output.buffer = &buffer;
+        output.requested = 1;
+        available = &output;
+
+        std::atomic<bool> stop{false};
+        std::thread rt([&] {
+            while (!stop.load(std::memory_order_relaxed))
+                keeby::AudioBoundary::on_process(&audio);
+        });
+        for (int i = 0; i < 20; ++i)
+            audio.swap_bank(make_bank(0.01f * static_cast<float>(i + 1))); // each call waits for its own ack
+        stop.store(true, std::memory_order_relaxed);
+        rt.join();
+        audio.stop();
+        available = nullptr;
+    }
+    { // Step 2.7 review fix 2: a bank swapped in before stop() must survive a
+      // stop()/start() restart. stop() used to unconditionally free every
+      // retired bank via retired_.clear(), leaving the mixer's OWN active
+      // bank dangling -- a real UAF on the very next trigger+mix after
+      // restart, which is exactly what this test drives (would abort under
+      // ASAN before the fix).
+        auto make_bank = [](float v) {
+            keeby::SoundBank bank;
+            bank.samples.push_back(keeby::Sample{{v, -v, v, -v}});
+            bank.press[KEY_A] = {0, 1};
+            return std::make_unique<const keeby::SoundBank>(std::move(bank));
+        };
+        keeby::KeyEventTransport events;
+        // Fixed gain (no randomized range) so the mixed sample is an exact,
+        // predictable value -- proof the data came from the swapped-in bank,
+        // not zeroed/garbage memory.
+        keeby::AudioBoundary audio(keeby::SoundBank{}, {.min_gain = keeby::kVoiceGain, .max_gain = keeby::kVoiceGain});
+        assert(audio.start(events));
+
+        std::array<float, 16> samples{};
+        spa_chunk chunk{};
+        spa_data data{};
+        data.data = samples.data();
+        data.maxsize = sizeof(samples);
+        data.chunk = &chunk;
+        spa_buffer buffer{};
+        buffer.n_datas = 1;
+        buffer.datas = &data;
+        pw_buffer output{};
+        output.buffer = &buffer;
+        output.requested = 1;
+        available = &output;
+
+        std::atomic<bool> stop_flag{false};
+        std::thread rt([&] {
+            while (!stop_flag.load(std::memory_order_relaxed))
+                keeby::AudioBoundary::on_process(&audio);
+        });
+        audio.swap_bank(make_bank(0.4f)); // acknowledged while the RT stand-in is running
+        stop_flag.store(true, std::memory_order_relaxed);
+        rt.join();
+
+        audio.stop();               // before the fix: freed the bank the mixer still pointed to
+        assert(audio.start(events)); // restart after stop is supported (engine_controller_test does this)
+
+        samples.fill(99.0f);
+        assert(events.try_push({KEY_A, keeby::KeyEventKind::Down, 0}));
+        keeby::AudioBoundary::on_process(&audio); // mixes from the still-owned 0.4f bank, not freed memory
+        // make_bank's Sample is {v, -v, v, -v} (see above): R is the negated L.
+        assert(samples[0] == 2.0f * keeby::kVoiceGain * 0.4f && samples[1] == -(2.0f * keeby::kVoiceGain * 0.4f));
+
+        audio.stop();
+        available = nullptr;
+    }
+    { // Step 2.7 review fix 1: a timed-out swap frees NOTHING (an
+      // unacknowledged request may not even be the latest one the RT thread
+      // has seen yet); only a later ACKNOWLEDGED swap prunes everything
+      // strictly older, including whatever an earlier timeout left behind.
+        auto make_bank = [](float v) {
+            keeby::SoundBank bank;
+            bank.samples.push_back(keeby::Sample{{v, -v, v, -v}});
+            bank.press[KEY_A] = {0, 1};
+            return std::make_unique<const keeby::SoundBank>(std::move(bank));
+        };
+        keeby::KeyEventTransport events;
+        keeby::AudioBoundary audio;
+        assert(audio.start(events));
+        assert(audio.retired_bank_count() == 0);
+
+        // No RT stand-in thread running yet: on_process() never runs, so
+        // this swap cannot be acknowledged and must time out (~500ms).
+        audio.swap_bank(make_bank(0.1f));
+        assert(audio.retired_bank_count() == 1); // timed out: nothing freed
+
+        std::array<float, 16> samples{};
+        spa_chunk chunk{};
+        spa_data data{};
+        data.data = samples.data();
+        data.maxsize = sizeof(samples);
+        data.chunk = &chunk;
+        spa_buffer buffer{};
+        buffer.n_datas = 1;
+        buffer.datas = &data;
+        pw_buffer output{};
+        output.buffer = &buffer;
+        output.requested = 1;
+        available = &output;
+
+        std::atomic<bool> stop_flag{false};
+        std::thread rt([&] {
+            while (!stop_flag.load(std::memory_order_relaxed))
+                keeby::AudioBoundary::on_process(&audio);
+        });
+        audio.swap_bank(make_bank(0.2f)); // callbacks running now: acknowledged quickly
+        stop_flag.store(true, std::memory_order_relaxed);
+        rt.join();
+        assert(audio.retired_bank_count() == 1); // only the now-active (0.2f) bank remains
+
+        audio.stop();
+        available = nullptr;
+    }
     std::puts("audio_boundary_test: OK (budget, deferred FIFO, buffers, lifecycle failures, mapped PCM, voice drops, repeat/release, frame cap, restart)");
+    std::puts("sound_fidelity boundary: OK (32 varied voices x 4096 frames, deferred event, retirement, seed/history reset)");
+    std::puts("sound_pack swap: OK (stopped-stream immediate free, concurrent RT-ack under a real swap_bank/retired_ path, "
+               "restart-after-swap survives stop(), timeout frees nothing then prunes on next ack)");
 }

@@ -6,6 +6,8 @@
 #include <spa/utils/result.h>
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <utility>
 
 namespace keeby {
@@ -18,7 +20,8 @@ constexpr pw_stream_events kStreamEvents = {
 
 } // namespace
 
-AudioBoundary::AudioBoundary(SampleBank samples) : mixer_(std::move(samples)) {
+AudioBoundary::AudioBoundary(SoundBank samples, MixerVariation variation)
+    : mixer_(std::move(samples), variation) {
     pw_init(nullptr, nullptr);
 }
 
@@ -108,8 +111,59 @@ void AudioBoundary::stop() {
         loop_ = nullptr;
     }
     mixer_.reset();
+    // RT thread is confirmed stopped now (pw_thread_loop_stop above already
+    // joined it, or it was never started): apply any still-pending swap
+    // synchronously -- same as swap_bank()'s own "not started" branch --
+    // then free every retired bank EXCEPT the one the mixer now actually
+    // points to. Freeing that one would leave bank_/active_bank_ dangling
+    // across a restart (start()/stop()/start() is supported; see
+    // tests/engine_controller_test.cpp), the same class of bug fix 2 in the
+    // Step 2.7 review fixed for swap_bank() itself.
+    mixer_.sync_bank();
+    const SoundBank* active_at_stop = mixer_.active_bank();
+    std::erase_if(retired_, [&](const std::unique_ptr<const SoundBank>& b) { return b.get() != active_at_stop; });
     transport_ = nullptr;
     started_ = false;
+}
+
+void AudioBoundary::swap_bank(std::unique_ptr<const SoundBank> bank) {
+    const SoundBank* raw = bank.get();
+    retired_.push_back(std::move(bank)); // keep alive at least until proven safe to drop, below
+    mixer_.request_bank(raw);
+    if (started_) {
+        // Bounded wait for the RT thread's acknowledgement (see sample_mixer.cpp's
+        // sync_bank(), called once per mix() callback). A timeout is not an error:
+        // see the pruning comment below for what happens then.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (mixer_.active_bank() != raw && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } else {
+        // No RT thread running at all: safe to switch synchronously, no wait needed.
+        mixer_.sync_bank();
+    }
+    // Only free anything once active_bank() == raw, i.e. the RT thread has
+    // acknowledged THIS exact request. requested_bank_/active_bank_ are a
+    // single writer (control thread) / single reader (RT thread) pair, and
+    // C++'s coherence rule for a single atomic object guarantees the RT
+    // thread's successive loads of requested_bank_ can never go backwards
+    // in publish order -- so once it has settled on `raw`, it can never
+    // later settle on anything OLDER, meaning every OTHER retired bank
+    // (including ones left over from earlier timed-out swaps) is now
+    // provably unreachable and safe to free.
+    //
+    // On a timeout, active_bank() may still be an older, not-yet-loaded
+    // request -- NOT necessarily `raw` itself, and not necessarily anything
+    // already in `retired_` either. Freeing anything here (even entries
+    // that are neither `raw` nor the current active_bank()) risks freeing a
+    // bank the RT thread hasn't reached yet but will: it does not skip
+    // straight to the latest request, it only ever loads whatever
+    // requested_bank_ holds AT THE TIME of its next sync_bank() call, which
+    // could still be an intermediate one if this thread published several
+    // requests in quick succession. So on timeout we free nothing at all;
+    // pruning happens on a later successful (acknowledged) swap, or
+    // unconditionally in stop() once the RT thread is confirmed gone.
+    if (mixer_.active_bank() == raw)
+        std::erase_if(retired_, [&](const std::unique_ptr<const SoundBank>& b) { return b.get() != raw; });
 }
 
 void AudioBoundary::on_process(void* userdata) noexcept {
@@ -130,7 +184,25 @@ void AudioBoundary::on_process(void* userdata) noexcept {
 // mixer:                     <=32 voice scans per event; <=32*4096*2 sample sums
 // external calls:            PipeWire dequeue/queue (documented RT safe), bounded
 //                            std::fill_n (compiled to memset); no decoder calls
-// See docs/003-step-2.2-sample-mixer.md for the complete bound and atomic inventory.
+// variation:                 <=64 xorshift32 steps + <=32 variant/gain selections
+// desktop control state:     <=32 relaxed atomic loads of enabled_ (one per accepted
+//                             event, inside handle_event) + <=32 relaxed atomic loads
+//                             of stereo_width_ (one per accepted trigger, inside
+//                             SampleMixer::trigger) + 1 relaxed atomic load of
+//                             master_gain_ per callback (inside mix()); all are plain
+//                             std::atomic reads/writes, never a mutex; no GUI/D-Bus call
+//                             is ever reachable from here (see tray_service.cpp, which
+//                             only ever writes those same atomics from its own thread).
+// bank swap (Step 2.7):      1 acquire load of requested_bank_ per callback (inside
+//                             mix()'s sync_bank()); on a change (rare): one bulk assignment
+//                             of the fixed 32-voice array plus two fixed 256-byte history
+//                             arrays (no allocation), then one release store of
+//                             active_bank_. swap_bank() itself (allocation, sleep_for,
+//                             freeing old banks) runs only on the EngineController/
+//                             AudioBoundary owner thread, never here.
+// See docs/004-step-2.3-sound-fidelity.md, docs/005-step-2.4-desktop-shell.md, and
+// docs/008-step-2.7-sound-packs.md for the complete bound, atomic, and swap-handshake
+// inventory.
 void AudioBoundary::process() noexcept {
     pw_buffer* b = pw_stream_dequeue_buffer(stream_);
     if (!b) return;
