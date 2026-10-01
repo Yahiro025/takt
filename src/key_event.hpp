@@ -3,19 +3,31 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <linux/input-event-codes.h>
+
 namespace keeby {
 
 // press/release, and repeat when the source distinguishes it (evdev does,
 // via EV_KEY value 2 — see docs/002-step-2.1-input-audio-boundary.md).
 enum class KeyEventKind : uint8_t { Up = 0, Down = 1, Repeat = 2 };
 
+inline constexpr uint16_t kKeyboardCodeLimit = 256;
+
+constexpr bool is_pointer_button_code(uint16_t code) noexcept {
+    return code == BTN_LEFT || code == BTN_RIGHT || code == BTN_MIDDLE;
+}
+
+constexpr bool is_supported_input_code(uint16_t code) noexcept {
+    return code < kKeyboardCodeLimit || is_pointer_button_code(code) || code == KEY_FN;
+}
+
 // Compact, trivially-copyable, real-time-path-safe. No strings, no heap
 // ownership, no UI state — nothing here may ever require an allocation
 // or a destructor call.
 //
 // Assumptions about `code`:
-//   - it is a raw Linux `KEY_*` constant from linux/input-event-codes.h,
-//     i.e. a physical key identity, not a layout-mapped character;
+//   - it is a raw Linux `KEY_*` code, KEY_FN, or one of BTN_LEFT/RIGHT/MIDDLE;
+//   - keyboard codes are physical key identities, not layout-mapped characters;
 //   - it is produced below the XKB/layout-translation layer, so it is
 //     stable across keyboard layouts by construction;
 //   - it is NOT unique across distinct physical keyboard devices — if
